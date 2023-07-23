@@ -73,14 +73,11 @@ SWITCH_TRANSFORMERS_PRETRAINED_MODEL_ARCHIVE_LIST = [
 def router_z_loss_func(router_logits: torch.Tensor) -> float:
     r"""
     Compute the router z-loss implemented in PyTorch.
-
     The router z-loss was introduced in [Designing Effective Sparse Expert Models](https://arxiv.org/abs/2202.08906).
     It encourages router logits to remain small in an effort to improve stability.
-
     Args:
         router_logits (`float`):
             Input logits of shape [batch_size, sequence_length, num_experts]
-
     Returns:
         Scalar router z-loss.
     """
@@ -93,17 +90,14 @@ def router_z_loss_func(router_logits: torch.Tensor) -> float:
 def load_balancing_loss_func(router_probs: torch.Tensor, expert_indices: torch.Tensor) -> float:
     r"""
     Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
-
     See Switch Transformer (https://arxiv.org/abs/2101.03961) for more details. This function implements the loss
     function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
     experts is too unbalanced.
-
     Args:
         router_probs (`torch.Tensor`):
             Probability assigned to each expert per token. Shape: [batch_size, seqeunce_length, num_experts].
         expert_indices (`torch.Tensor`):
             Indices tensor of shape [batch_size, seqeunce_length] identifying the selected expert for a given token.
-
     Returns:
         The auxiliary loss.
     """
@@ -132,12 +126,10 @@ def load_balancing_loss_func(router_probs: torch.Tensor, expert_indices: torch.T
 class SwitchTransformersTop1Router(nn.Module):
     """
     Router using tokens choose top-1 experts assignment.
-
     This router uses the same mechanism as in Switch Transformer (https://arxiv.org/abs/2101.03961) and V-MoE
     (https://arxiv.org/abs/2106.05974): tokens choose their top experts. Items are sorted by router_probs and then
     routed to their choice of expert until the expert's expert_capacity is reached. **There is no guarantee that each
     token is processed by an expert**, or that each expert receives at least one token.
-
     """
 
     def __init__(self, config: SwitchTransformersConfig):
@@ -152,7 +144,6 @@ class SwitchTransformersTop1Router(nn.Module):
     def _compute_router_probabilities(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         r"""
         Computes router probabilities from input hidden states.
-
         Args:
             hidden_states (`torch.Tensor`):
                 (batch_size, sequence_length, hidden_dim) from which router probabilities are computed.
@@ -204,11 +195,9 @@ class SwitchTransformersTop1Router(nn.Module):
         Generic forward function for every Router class. Each Router expects to have the same input hidden states
         (`hidden_states`) corresponding to the hidden states for each token, the `expert_capacity` corresponding to the
         number of tokens the Router will send to each expert, some Routers can send up to few tokens to each expert.
-
         Each Router works as the following: it expects the hidden states for each token, gets the `router_probs` and
         `router_logits` from the `router_weights`. This will assign for each token, the raw probability to be assigned
         to an expert. Then each Router class will have to define its own `_compute_routing_instructions`.
-
         Args:
             hidden_states (`torch.Tensor`) :
                 [num_groups, tokens_per_group, hidden_dim] inputs to send to experts.
@@ -277,6 +266,43 @@ class SwitchTransformersDenseActDense(nn.Module):
         hidden_states = self.wo(hidden_states)
         return hidden_states
 
+class BatchMatmul(nn.Module):
+    def __init__(self, w):
+        super().__init__()
+        self.w = w
+        # self.op = op
+    
+    def forward(self, hidden_states, mask):
+        # print(hidden_states.unsqueeze(0).shape, self.w.shape)
+        y = torch.einsum("ij,bjk->bik", hidden_states, self.w)
+        # print(y.shape, mask.shape)
+        y = (y * mask).sum(0)
+        # y = self.op(hidden_states, w, mask).mean(0, keepdim=True)
+        return y
+
+
+class SwitchTransformersDenseActDenseSparse(nn.Module):
+    def __init__(self, config: SwitchTransformersConfig, wi, wo):
+        super().__init__()
+        self.wi = BatchMatmul(wi)
+        self.wo = BatchMatmul(wo)
+        self.dropout = nn.Dropout(config.dropout_rate)
+        self.act = ACT2FN[config.dense_act_fn]
+
+    def forward(self, hidden_states, expert_mask=None):
+        B, T, X = expert_mask.shape
+        expert_mask = expert_mask.permute(2, 0, 1)
+        hidden_states = hidden_states.reshape(B * T, -1)
+        expert_mask = expert_mask.reshape(-1, B * T, 1)
+        c = expert_mask.sum(-1).sum(-1) / expert_mask.shape[1]
+        # print(torch.mean(c).item(), torch.std(c).item(), c)
+        hidden_states = self.wi(hidden_states, expert_mask)
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.wo(hidden_states, expert_mask)
+        hidden_states = hidden_states.reshape(B, T, -1)
+        return hidden_states
+
 
 # Copied from transformers.models.t5.modeling_t5.T5DenseGatedActDense with T5->SwitchTransformers
 class SwitchTransformersDenseGatedActDense(nn.Module):
@@ -306,6 +332,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         super().__init__()
         # Step 1: Get the correct router according to its class
         self.router = SwitchTransformersTop1Router(config)
+        self.config = config
 
         # Step 2: Get the experts
         self.experts = nn.ModuleDict()
@@ -315,14 +342,11 @@ class SwitchTransformersSparseMLP(nn.Module):
     def forward(self, hidden_states):
         r"""
         Hold on, this will be slightly tricky to understand In the correct order, a MoE layer does the following:
-
         1- Gets the `router_mask` from the router. The shape of the mask is `(batch_size, sequence_length, num_expert)`
         and corresponds to the argmax of the `router_probs`. The probabilities are needed in the computation of the
         hidden states : they are broadcasted to the hidden states values (can be interpreted as a scaling factor).
-
         2- Dispatch the tokens to its associated experts. We do a classic for loop over the experts and assign for each
         expert the corresponding hidden states.
-
         """
         # Step 1: Get the router_mask from the router as wel as the probabilities
         router_mask, router_probs, router_logits = self.router(hidden_states)
@@ -331,14 +355,22 @@ class SwitchTransformersSparseMLP(nn.Module):
         # The routers introduced might not always map all the tokens, to a router, which means that some hidden states
         # can be unchanged from one layer to another. That is why the hidden states are cloned before updating only the seleced ones.
 
-        next_states = hidden_states.clone()
-        for idx, expert in enumerate(self.experts.values()):
-
-            token_indices = router_mask[:, :, idx].bool()
-            next_states[token_indices] = expert(hidden_states[token_indices])
+        next_states = self.experts(hidden_states, router_mask)
+        # next_states = hidden_states.clone()
+        # for idx, expert in enumerate(self.experts.values()):
+        #     token_indices = router_mask[:, :, idx].bool()
+        #     next_states[token_indices] = expert(hidden_states[token_indices])
 
         hidden_states = router_probs * next_states
         return hidden_states, (router_logits, expert_index)
+
+    def fuse_expert(self):
+        wi = torch.stack([self.experts[f"expert_{idx}"].wi.weight.data.T for idx in range(self.config.num_experts)], dim=0)
+        wo = torch.stack([self.experts[f"expert_{idx}"].wo.weight.data.T for idx in range(self.config.num_experts)], dim=0)
+        device = self.experts[f"expert_0"].wi.weight.device
+        del self.experts
+        torch.cuda.empty_cache()
+        self.experts = SwitchTransformersDenseActDenseSparse(self.config, wi, wo).to(device)
 
 
 class SwitchTransformersLayerFF(nn.Module):
@@ -436,20 +468,17 @@ class SwitchTransformersAttention(nn.Module):
         """
         Adapted from Mesh Tensorflow:
         https://github.com/tensorflow/mesh/blob/0cb87fe07da627bf0b7e60475d59f95ed6b5be3d/mesh_tensorflow/transformer/transformer_layers.py#L593
-
         Translate relative position to a bucket number for relative attention. The relative position is defined as
         memory_position - query_position, i.e. the distance in tokens from the attending position to the attended-to
         position. If bidirectional=False, then positive relative positions are invalid. We use smaller buckets for
         small absolute relative_position and larger buckets for larger absolute relative_positions. All relative
         positions >=max_distance map to the same bucket. All relative positions <=-max_distance map to the same bucket.
         This should allow for more graceful generalization to longer sequences than the model has been trained on
-
         Args:
             relative_position: an int32 Tensor
             bidirectional: a boolean - whether the attention is bidirectional
             num_buckets: an integer
             max_distance: an integer
-
         Returns:
             a Tensor with the same shape as relative_position, containing int32 values in the range [0, num_buckets)
         """
@@ -550,12 +579,6 @@ class SwitchTransformersAttention(nn.Module):
                     # self-attn
                     # (batch_size, n_heads, key_length, dim_per_head)
                     hidden_states = torch.cat([past_key_value, hidden_states], dim=2)
-                elif past_key_value.shape[2] != key_value_states.shape[1]:
-                    # checking that the `sequence_length` of the `past_key_value` is the same as
-                    # the provided `key_value_states` to support prefix tuning
-                    # cross-attn
-                    # (batch_size, n_heads, seq_length, dim_per_head)
-                    hidden_states = shape(proj_layer(key_value_states))
                 else:
                     # cross-attn
                     hidden_states = past_key_value
@@ -1188,22 +1211,18 @@ class SwitchTransformersStack(SwitchTransformersPreTrainedModel):
 
 
 SWITCH_TRANSFORMERS_START_DOCSTRING = r"""
-
     The SWITCH_TRANSFORMERS model was proposed in [Switch Transformers: Scaling to Trillion Parameter Models with
     Simple and Efficient Sparsity](https://arxiv.org/abs/2101.03961) by [William
     Fedus](https://arxiv.org/search/cs?searchtype=author&query=Fedus%2C+W), [Barret
     Zoph](https://arxiv.org/search/cs?searchtype=author&query=Zoph%2C+B), and [Noam
     Shazeer](https://arxiv.org/search/cs?searchtype=author&query=Shazeer%2C+N). It's an encoder-decoder T5-like model
     with sparse Feed Forward that stands for Mixture of Experts (MoE) architecture.
-
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
     library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
     etc.)
-
     This model is also a PyTorch [torch.nn.Module](https://pytorch.org/docs/stable/nn.html#torch.nn.Module) subclass.
     Use it as a regular PyTorch Module and refer to the PyTorch documentation for all matter related to general usage
     and behavior.
-
     Parameters:
         config ([`SwitchTransformersConfig`]): Model configuration class with all the parameters of the model.
             Initializing with a config file does not load the weights associated with the model, only the
@@ -1215,33 +1234,24 @@ SWITCH_TRANSFORMERS_INPUTS_DOCSTRING = r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
             Indices of input sequence tokens in the vocabulary. SWITCH_TRANSFORMERS is a model with relative position
             embeddings so you should be able to pad the inputs on both the right and the left.
-
             Indices can be obtained using [`T5Tokenizer`]. See [`PreTrainedTokenizer.encode`] and
             [`PreTrainedTokenizer.__call__`] for detail.
-
             [What are input IDs?](../glossary#input-ids)
-
             To know more on how to prepare `input_ids` for pretraining take a look a [SWITCH_TRANSFORMERS
             Training](./switch_transformers#training).
         attention_mask (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
-
             - 1 for tokens that are **not masked**,
             - 0 for tokens that are **masked**.
-
             [What are attention masks?](../glossary#attention-mask)
         decoder_input_ids (`torch.LongTensor` of shape `(batch_size, target_sequence_length)`, *optional*):
             Indices of decoder input sequence tokens in the vocabulary.
-
             Indices can be obtained using [`T5Tokenizer`]. See [`PreTrainedTokenizer.encode`] and
             [`PreTrainedTokenizer.__call__`] for details.
-
             [What are decoder input IDs?](../glossary#decoder-input-ids)
-
             SWITCH_TRANSFORMERS uses the `pad_token_id` as the starting token for `decoder_input_ids` generation. If
             `past_key_values` is used, optionally only the last `decoder_input_ids` have to be input (see
             `past_key_values`).
-
             To know more on how to prepare `decoder_input_ids` for pretraining take a look at [SWITCH_TRANSFORMERS
             Training](./switch_transformers#training).
         decoder_attention_mask (`torch.BoolTensor` of shape `(batch_size, target_sequence_length)`, *optional*):
@@ -1250,31 +1260,24 @@ SWITCH_TRANSFORMERS_INPUTS_DOCSTRING = r"""
         head_mask (`torch.FloatTensor` of shape `(num_heads,)` or `(num_layers, num_heads)`, *optional*):
             Mask to nullify selected heads of the self-attention modules in the encoder. Mask values selected in `[0,
             1]`:
-
             - 1 indicates the head is **not masked**,
             - 0 indicates the head is **masked**.
-
         decoder_head_mask (`torch.FloatTensor` of shape `(num_heads,)` or `(num_layers, num_heads)`, *optional*):
             Mask to nullify selected heads of the self-attention modules in the decoder. Mask values selected in `[0,
             1]`:
-
             - 1 indicates the head is **not masked**,
             - 0 indicates the head is **masked**.
-
         cross_attn_head_mask (`torch.Tensor` of shape `(num_heads,)` or `(num_layers, num_heads)`, *optional*):
                 Mask to nullify selected heads of the cross-attention modules in the decoder. Mask values selected in
                 `[0, 1]`:
-
                 - 1 indicates the head is **not masked**,
                 - 0 indicates the head is **masked**.
-
         encoder_outputs (`tuple(tuple(torch.FloatTensor)`, *optional*):
             Tuple consists of (`last_hidden_state`, `optional`: *hidden_states*, `optional`: *attentions*)
             `last_hidden_state` of shape `(batch_size, sequence_length, hidden_size)` is a sequence of hidden states at
             the output of the last layer of the encoder. Used in the cross-attention of the decoder.
         past_key_values (`tuple(tuple(torch.FloatTensor))` of length `config.n_layers` with each tuple having 4 tensors of shape `(batch_size, num_heads, sequence_length - 1, embed_size_per_head)`):
             Contains precomputed key and value hidden states of the attention blocks. Can be used to speed up decoding.
-
             If `past_key_values` are used, the user can optionally input only the last `decoder_input_ids` (those that
             don't have their past key value states given to this model) of shape `(batch_size, 1)` instead of all
             `decoder_input_ids` of shape `(batch_size, sequence_length)`.
@@ -1287,14 +1290,11 @@ SWITCH_TRANSFORMERS_INPUTS_DOCSTRING = r"""
             representation. If `past_key_values` is used, optionally only the last `decoder_inputs_embeds` have to be
             input (see `past_key_values`). This is useful if you want more control over how to convert
             `decoder_input_ids` indices into associated vectors than the model's internal embedding lookup matrix.
-
             If `decoder_input_ids` and `decoder_inputs_embeds` are both unset, `decoder_inputs_embeds` takes the value
             of `inputs_embeds`.
-
         use_cache (`bool`, *optional*):
             If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding (see
             `past_key_values`).
-
         output_attentions (`bool`, *optional*):
             Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned
             tensors for more detail.
@@ -1313,25 +1313,19 @@ SWITCH_TRANSFORMERS_ENCODER_INPUTS_DOCSTRING = r"""
         input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
             Indices of input sequence tokens in the vocabulary. SWITCH_TRANSFORMERS is a model with relative position
             embeddings so you should be able to pad the inputs on both the right and the left.
-
             Indices can be obtained using [`T5Tokenizer`]. See [`PreTrainedTokenizer.encode`] and
             [`PreTrainedTokenizer.__call__`] for detail.
-
             To know more on how to prepare `input_ids` for pretraining take a look a [SWITCH_TRANSFORMERS
             Training](./switch_transformers#training).
         attention_mask (`torch.FloatTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
-
             - 1 for tokens that are **not masked**,
             - 0 for tokens that are **masked**.
-
             [What are attention masks?](../glossary#attention-mask)
         head_mask (`torch.FloatTensor` of shape `(num_heads,)` or `(num_layers, num_heads)`, *optional*):
             Mask to nullify selected heads of the self-attention modules. Mask values selected in `[0, 1]`:
-
             - 1 indicates the head is **not masked**,
             - 0 indicates the head is **masked**.
-
         inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
             Optionally, instead of passing `input_ids` you can choose to directly pass an embedded representation. This
             is useful if you want more control over how to convert `input_ids` indices into associated vectors than the
@@ -1431,24 +1425,18 @@ class SwitchTransformersModel(SwitchTransformersPreTrainedModel):
     ) -> Union[Tuple[torch.FloatTensor], Seq2SeqMoEModelOutput]:
         r"""
         Returns:
-
         Example:
-
         ```python
         >>> from transformers import T5Tokenizer, SwitchTransformersModel
-
         >>> tokenizer = T5Tokenizer.from_pretrained("google/switch-base-8")
         >>> model = SwitchTransformersModel.from_pretrained("google/switch-base-8")
-
         >>> input_ids = tokenizer(
         ...     "Studies have been shown that owning a dog is good for you", return_tensors="pt"
         ... ).input_ids  # Batch size 1
         >>> decoder_input_ids = tokenizer("Studies show that", return_tensors="pt").input_ids  # Batch size 1
-
         >>> # preprocess: Prepend decoder_input_ids with start token which is pad token for SwitchTransformersModel.
         >>> # This is not needed for torch's SwitchTransformersForConditionalGeneration as it does this internally using labels arg.
         >>> decoder_input_ids = model._shift_right(decoder_input_ids)
-
         >>> # forward pass
         >>> outputs = model(input_ids=input_ids, decoder_input_ids=decoder_input_ids)
         >>> last_hidden_states = outputs.last_hidden_state
@@ -1613,24 +1601,18 @@ class SwitchTransformersForConditionalGeneration(SwitchTransformersPreTrainedMod
             Labels for computing the sequence classification/regression loss. Indices should be in `[-100, 0, ...,
             config.vocab_size - 1]`. All labels set to `-100` are ignored (masked), the loss is only computed for
             labels in `[0, ..., config.vocab_size]`
-
         Returns:
-
         Examples:
-
         ```python
         >>> from transformers import T5Tokenizer, SwitchTransformersForConditionalGeneration
-
         >>> tokenizer = T5Tokenizer.from_pretrained("google/switch-base-8")
         >>> model = SwitchTransformersForConditionalGeneration.from_pretrained("google/switch-base-8")
-
         >>> # training
         >>> input_ids = tokenizer("The <extra_id_0> walks in <extra_id_1> park", return_tensors="pt").input_ids
         >>> labels = tokenizer("<extra_id_0> cute dog <extra_id_1> the <extra_id_2>", return_tensors="pt").input_ids
         >>> outputs = model(input_ids=input_ids, labels=labels)
         >>> loss = outputs.loss
         >>> logits = outputs.logits
-
         >>> # inference
         >>> input_ids = tokenizer(
         ...     "summarize: studies have shown that owning a dog is good for you", return_tensors="pt"
@@ -1897,12 +1879,9 @@ class SwitchTransformersEncoderModel(SwitchTransformersPreTrainedModel):
     ) -> Union[Tuple[torch.FloatTensor], MoEModelOutput]:
         r"""
         Returns:
-
         Example:
-
         ```python
         >>> from transformers import T5Tokenizer, SwitchTransformersEncoderModel
-
         >>> tokenizer = T5Tokenizer.from_pretrained("google/switch-base-8")
         >>> model = SwitchTransformersEncoderModel.from_pretrained("google/switch-base-8")
         >>> input_ids = tokenizer(
