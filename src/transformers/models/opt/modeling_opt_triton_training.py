@@ -735,8 +735,8 @@ class OPTDecoder(OPTPreTrainedModel):
 
             if output_hidden_states:
                 all_hidden_states += (layer_outputs[-1],)
-            if idx > 20:
-                break
+            # if idx > 20:
+            #     break
 
         if self.final_layer_norm is not None:
             hidden_states = self.final_layer_norm(hidden_states)
