@@ -678,8 +678,8 @@ class SwitchTransformersLayerSelfAttention(nn.Module):
     ):
         
         normed_hidden_states = self.layer_norm(hidden_states)
-        torch.save([self.SelfAttention, normed_hidden_states, attention_mask, position_bias, layer_head_mask], "debug.pt")
-        assert False
+        # torch.save([self.SelfAttention, normed_hidden_states, attention_mask, position_bias, layer_head_mask], "debug.pt")
+        # assert False
         attention_output = self.SelfAttention(
             normed_hidden_states,
             mask=attention_mask,
