@@ -364,7 +364,8 @@ class BertSelfAttention(nn.Module):
             context_layer = torch.matmul(attention_probs, value_layer)
 
         else:
-            context_layer = self.spa(query_layer, key_layer, value_layer)
+            with torch.no_grad():
+                context_layer = self.spa(query_layer, key_layer, value_layer)
             attention_probs = None
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
@@ -1523,9 +1524,9 @@ class BertForSequenceClassification(BertPreTrainedModel):
             config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
             `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
         """
-        # seq_length = attention_mask.sum(-1).to(torch.int32)
-        # self.bert.spa.set_global_seqlens(seq_length)
-        # self.bert.encoder.layer[0].output.dense.set_global_seqlens(seq_length)
+        seq_length = attention_mask.sum(-1).to(torch.int32)
+        self.bert.spa.set_global_seqlens(seq_length)
+        self.bert.encoder.layer[0].output.dense.set_global_seqlens(seq_length)
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         outputs = self.bert(
