@@ -404,7 +404,7 @@ class SwitchTransformersSparseMLP(nn.Module):
         # self.time += time.time() - st
         return hidden_states, (router_logits, expert_index)
 
-    def fuse_expert(self):
+    def fuse_expert(self, use_fp16: bool = False):
         hidden_size = self.config.d_model
         intermediate_size = self.config.d_ff
         num_experts = self.config.num_experts
@@ -423,7 +423,7 @@ class SwitchTransformersSparseMLP(nn.Module):
 
         wi = deepspeed.init_inference(wi,
                                     mp_size=1,
-                                    dtype=torch.float16,
+                                    dtype=torch.float16 if use_fp16 else torch.float32,
                                     moe_experts=[num_experts],
                                     replace_with_kernel_inject=True).module
         # wo = deepspeed.init_inference(wo,
