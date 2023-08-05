@@ -55,6 +55,7 @@ else:
 
 if TYPE_CHECKING:
     from .configuration_swin import SWIN_PRETRAINED_CONFIG_ARCHIVE_MAP, SwinConfig, SwinOnnxConfig
+    from .configuration_swin_moe import SwinMoEConfig
 
     try:
         if not is_torch_available():
