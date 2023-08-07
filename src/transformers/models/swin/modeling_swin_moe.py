@@ -568,9 +568,9 @@ class SwinIntermediate(nn.Module):
 
 
 class SwinOutput(nn.Module):
-    def __init__(self, config, dim):
+    def __init__(self, config, dim: int, is_moe: bool = False):
         super().__init__()
-        self.dense = nn.Linear(int(config.mlp_ratio * dim), dim, bias=config.mlp_fc2_bias)
+        self.dense = nn.Linear(int(config.mlp_ratio * dim), dim, bias=config.mlp_fc2_bias and not is_moe)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -665,14 +665,12 @@ class SwinMoETop1Router(nn.Module):
         return expert_index, router_probs, router_logits
 
 class SwinMLP(nn.Module):
-    def __init__(self, config, in_features: int):
+    def __init__(self, config, in_features: int, is_moe: bool = False):
         super().__init__()
-        self.layernorm_after = nn.LayerNorm(in_features, eps=config.layer_norm_eps)
         self.intermediate = SwinIntermediate(config, in_features)
-        self.output = SwinOutput(config, in_features)
+        self.output = SwinOutput(config, in_features, is_moe=is_moe)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        layer_output = self.layernorm_after(hidden_states)
+    def forward(self, hidden_states: torch.Tensor, layer_output: torch.Tensor) -> torch.Tensor:
         layer_output = self.intermediate(layer_output)
         layer_output = hidden_states + self.output(layer_output)
         return layer_output
@@ -686,7 +684,7 @@ class SwinMoESparseMLP(nn.Module):
         # Step 2: Get the experts
         self.experts = nn.ModuleDict()
         for idx in range(config.num_experts):
-            self.experts[f"expert_{idx}"] = expert_class(config, in_features)
+            self.experts[f"expert_{idx}"] = expert_class(config, in_features, is_moe=True)
 
     def forward(self, hidden_states):
         r"""
@@ -725,6 +723,7 @@ class SwinLayer(nn.Module):
         self.layernorm_before = nn.LayerNorm(dim, eps=config.layer_norm_eps)
         self.attention = SwinAttention(config, dim, num_heads, window_size=self.window_size)
         self.drop_path = SwinDropPath(config.drop_path_rate) if config.drop_path_rate > 0.0 else nn.Identity()
+        self.layernorm_after = nn.LayerNorm(dim, eps=config.layer_norm_eps)
 
         self.is_moe = is_moe
         if self.is_moe:
@@ -833,7 +832,8 @@ class SwinLayer(nn.Module):
 
         hidden_states = shortcut + self.drop_path(attention_windows)
 
-        layer_output = self.mlp(hidden_states)
+        layer_output = self.layernorm_after(hidden_states)
+        layer_output = self.mlp(hidden_states, layer_output)
 
         layer_outputs = (layer_output, attention_outputs[1]) if output_attentions else (layer_output,)
         return layer_outputs
