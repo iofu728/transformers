@@ -42,6 +42,8 @@ from .configuration_swin_moe import SwinMoEConfig
 
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 import numpy as np
+from sparta.opset.sparse_moe import DynamicSparseMoE
+from sparta.opset import *
 import time
 
 
@@ -677,6 +679,20 @@ class SwinMLP(nn.Module):
         layer_output = hidden_states + self.output(layer_output)
         return layer_output
 
+class SwinMoEDenseActDenseSparse(nn.Module):
+    def __init__(self, config: SwinMoEConfig, wi, wo):
+        super().__init__()
+        self.wi = wi
+        self.wo = wo
+
+    def forward(self, hidden_states, layer_output, expert_mask=None):
+        B, T = expert_mask.shape
+        # expert_mask = expert_mask.permute(2, 0, 1)
+        hidden_states = hidden_states.reshape(B * T, -1)
+        expert_mask = expert_mask.reshape(B * T).int()
+
+        return self.wo(self.wi(hidden_states, expert_mask, True), expert_mask).reshape(B, T, -1) + layer_output
+
 class SwinMoESparseMLP(nn.Module):
     def __init__(self, config: SwinMoEConfig, in_features: int, expert_class: nn.Module = SwinMLP):
         super().__init__()
@@ -687,7 +703,6 @@ class SwinMoESparseMLP(nn.Module):
         self.experts = nn.ModuleDict()
         for idx in range(config.num_experts):
             self.experts[f"expert_{idx}"] = expert_class(config, in_features, is_moe=True)
-        self.time = []
 
     def forward(self, layer_output: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         r"""
@@ -702,8 +717,6 @@ class SwinMoESparseMLP(nn.Module):
 
         """
         # Step 1: Get the router_mask from the router as wel as the probabilities
-        torch.cuda.synchronize()
-        st = time.time()
         router_mask, router_probs, router_logits = self.router(hidden_states)
         expert_index = torch.argmax(router_mask, dim=-1)
 
@@ -715,9 +728,6 @@ class SwinMoESparseMLP(nn.Module):
             next_states[token_indices] = expert(hidden_states[token_indices], layer_output[token_indices])
 
         hidden_states = router_probs * next_states
-        torch.cuda.synchronize()
-        end = time.time()
-        self.time.append(end - st)
         return hidden_states
 
 

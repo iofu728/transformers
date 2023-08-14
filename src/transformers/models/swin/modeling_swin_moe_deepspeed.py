@@ -43,6 +43,8 @@ from .configuration_swin_moe import SwinMoEConfig
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 import numpy as np
 import time
+import deepspeed
+from deepspeed.moe.sharded_moe import MOELayer, TopKGate
 
 
 logger = logging.get_logger(__name__)
@@ -655,13 +657,13 @@ class SwinMoETop1Router(nn.Module):
         router_probs, router_logits = self._compute_router_probabilities(hidden_states)
 
         expert_index = torch.argmax(router_probs, dim=-1)
-        expert_index = torch.nn.functional.one_hot(expert_index, num_classes=self.num_experts)
+        # expert_index = torch.nn.functional.one_hot(expert_index, num_classes=self.num_experts)
 
         # Mask tokens outside expert capacity. Sum over each sequence
-        token_priority = torch.cumsum(expert_index, dim=-2)
+        # token_priority = torch.cumsum(expert_index, dim=-2)
         # mask if the token routed to to the expert will overflow
-        expert_capacity_mask = token_priority <= self.expert_capacity
-        expert_index = expert_index * expert_capacity_mask
+        # expert_capacity_mask = token_priority <= self.expert_capacity
+        # expert_index = expert_index * expert_capacity_mask
 
         router_probs = torch.max(router_probs, dim=-1).values.unsqueeze(-1)
         return expert_index, router_probs, router_logits
@@ -677,19 +679,68 @@ class SwinMLP(nn.Module):
         layer_output = hidden_states + self.output(layer_output)
         return layer_output
 
+class Experts(torch.nn.Module):
+    def __init__(self, experts, num_local_experts=1, expert_group_name=None):
+        super(Experts, self).__init__()
+
+        self.deepspeed_experts = torch.nn.ModuleList(experts)
+        self.num_local_experts = num_local_experts
+
+        # TODO: revisit allreduce for moe.gate...
+        for expert in self.deepspeed_experts:
+            # TODO: Create param groups to handle expert + data case (e.g. param.group = moe_group)
+            for name, param in expert.named_parameters():
+                param.allreduce = False
+                param.group_name = expert_group_name
+
+    def forward(self, inputs):
+        chunks = inputs.chunk(self.num_local_experts, dim=1)
+        expert_outputs = []
+        for chunk, expert in zip(chunks, self.deepspeed_experts):
+            out = expert(chunk)
+            if type(out) is tuple:
+                out = out[0]  # Ignore the bias term for now
+            expert_outputs += [out]
+
+        expert_output = torch.cat(expert_outputs, dim=1)
+        return expert_output
+
+
+class SwinMoEDenseActDenseSparse(nn.Module):
+    def __init__(self, config: SwinMoEConfig, wi):
+        super().__init__()
+        self.wi = wi
+        # self.wo = wo
+        # self.dropout = nn.Dropout(config.dropout_rate)
+        # self.act = ACT2FN[config.dense_act_fn]
+
+    def forward(self, hidden_states):
+        # B, T = expert_mask.shape
+        # expert_mask = expert_mask.permute(2, 0, 1)
+        # hidden_states = hidden_states.reshape(B * T, -1)
+        # expert_mask = expert_mask.reshape(B * T).int()
+        # torch.save([self.wi, hidden_states], "debug.pt")
+        hidden_states = self.wi(hidden_states, None)
+        # hidden_states = self.act(hidden_states)
+        # hidden_states = self.dropout(hidden_states)
+        # hidden_states = self.wo(hidden_states, None)
+        return hidden_states
+
 class SwinMoESparseMLP(nn.Module):
     def __init__(self, config: SwinMoEConfig, in_features: int, expert_class: nn.Module = SwinMLP):
         super().__init__()
         # Step 1: Get the correct router according to its class
         self.router = SwinMoETop1Router(config, in_features)
+        self.config = config
+        self.in_features = in_features
 
         # Step 2: Get the experts
         self.experts = nn.ModuleDict()
         for idx in range(config.num_experts):
             self.experts[f"expert_{idx}"] = expert_class(config, in_features, is_moe=True)
-        self.time = []
 
     def forward(self, layer_output: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.experts(hidden_states) + layer_output
         r"""
         Hold on, this will be slightly tricky to understand In the correct order, a MoE layer does the following:
 
@@ -702,8 +753,6 @@ class SwinMoESparseMLP(nn.Module):
 
         """
         # Step 1: Get the router_mask from the router as wel as the probabilities
-        torch.cuda.synchronize()
-        st = time.time()
         router_mask, router_probs, router_logits = self.router(hidden_states)
         expert_index = torch.argmax(router_mask, dim=-1)
 
@@ -715,10 +764,39 @@ class SwinMoESparseMLP(nn.Module):
             next_states[token_indices] = expert(hidden_states[token_indices], layer_output[token_indices])
 
         hidden_states = router_probs * next_states
-        torch.cuda.synchronize()
-        end = time.time()
-        self.time.append(end - st)
         return hidden_states
+
+    def fuse_expert(self, use_fp16: bool = False):
+        hidden_size = self.in_features
+        intermediate_size = hidden_size * 4
+        num_experts = self.config.num_experts
+        k = 1
+
+        gate = TopKGate(hidden_size, num_experts, k, 1, 1, self.config.expert_capacity, None, True, True)
+        gate.wg = self.router.classifier
+
+        wi = MOELayer(
+            gate,
+            Experts([self.experts[f"expert_{idx}"].intermediate.dense for idx in range(self.config.num_experts)]),
+            Experts([self.experts[f"expert_{idx}"].output.dense for idx in range(self.config.num_experts)]),
+            "ep_size_1", 1, num_experts, hidden_size, hidden_size, use_tutel=True
+        )
+        # wo = MOELayer(gate, , "ep_size_1", 1, num_experts, hidden_size, intermediate_size, use_tutel=False)
+
+        wi = deepspeed.init_inference(wi,
+                                    mp_size=1,
+                                    dtype=torch.float16 if use_fp16 else torch.float32,
+                                    moe_experts=[num_experts],
+                                    replace_with_kernel_inject=True).module
+        # wo = deepspeed.init_inference(wo,
+        #                             mp_size=1,
+        #                             dtype=torch.float16,
+        #                             moe_experts=[num_experts],
+        #                             replace_with_kernel_inject=True).module
+        device = self.experts[f"expert_0"].intermediate.dense.weight.device
+        del self.experts
+        torch.cuda.empty_cache()
+        self.experts = SwinMoEDenseActDenseSparse(self.config, wi).to(device)
 
 
 class SwinLayer(nn.Module):

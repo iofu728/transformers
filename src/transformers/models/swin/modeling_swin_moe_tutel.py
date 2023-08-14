@@ -42,7 +42,6 @@ from .configuration_swin_moe import SwinMoEConfig
 
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 import numpy as np
-import time
 
 
 logger = logging.get_logger(__name__)
@@ -666,6 +665,45 @@ class SwinMoETop1Router(nn.Module):
         router_probs = torch.max(router_probs, dim=-1).values.unsqueeze(-1)
         return expert_index, router_probs, router_logits
 
+class BatchMatmul(nn.Module):
+    def __init__(self, w):
+        super().__init__()
+        self.w = w
+        # self.op = op
+    
+    def forward(self, hidden_states, mask):
+        # print(hidden_states.unsqueeze(0).shape, self.w.shape)
+        y = torch.einsum("ij,bjk->bik", hidden_states, self.w)
+        # print(y.shape, mask.shape)
+        y = (y * mask).sum(0)
+        # y = self.op(hidden_states, w, mask).mean(0, keepdim=True)
+        return y
+
+
+class SwinDenseActDenseSparse(nn.Module):
+    def __init__(self, config: SwinMoEConfig, wi, wo):
+        super().__init__()
+        self.wi = BatchMatmul(wi)
+        self.wo = BatchMatmul(wo)
+        if isinstance(config.hidden_act, str):
+            self.intermediate_act_fn = ACT2FN[config.hidden_act]
+        else:
+            self.intermediate_act_fn = config.hidden_act
+
+    def forward(self, layer_output, hidden_states, expert_mask=None):
+        B, T, X = expert_mask.shape
+        expert_mask = expert_mask.permute(2, 0, 1)
+        hidden_states = hidden_states.reshape(B * T, -1)
+        expert_mask = expert_mask.reshape(-1, B * T, 1)
+        c = expert_mask.sum(-1).sum(-1) / expert_mask.shape[1]
+        # print(torch.mean(c).item(), torch.std(c).item(), c)
+        hidden_states = self.wi(hidden_states, expert_mask)
+        hidden_states = self.intermediate_act_fn(hidden_states)
+        hidden_states = self.wo(hidden_states, expert_mask)
+        hidden_states = hidden_states.reshape(B, T, -1)
+        return hidden_states + layer_output
+
+
 class SwinMLP(nn.Module):
     def __init__(self, config, in_features: int, is_moe: bool = False):
         super().__init__()
@@ -682,12 +720,12 @@ class SwinMoESparseMLP(nn.Module):
         super().__init__()
         # Step 1: Get the correct router according to its class
         self.router = SwinMoETop1Router(config, in_features)
+        self.config = config
 
         # Step 2: Get the experts
         self.experts = nn.ModuleDict()
         for idx in range(config.num_experts):
             self.experts[f"expert_{idx}"] = expert_class(config, in_features, is_moe=True)
-        self.time = []
 
     def forward(self, layer_output: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
         r"""
@@ -702,23 +740,28 @@ class SwinMoESparseMLP(nn.Module):
 
         """
         # Step 1: Get the router_mask from the router as wel as the probabilities
-        torch.cuda.synchronize()
-        st = time.time()
         router_mask, router_probs, router_logits = self.router(hidden_states)
         expert_index = torch.argmax(router_mask, dim=-1)
 
         # The routers introduced might not always map all the tokens, to a router, which means that some hidden states
         # can be unchanged from one layer to another. That is why the hidden states are cloned before updating only the seleced ones.
-        next_states = hidden_states.clone()
-        for idx, expert in enumerate(self.experts.values()):
-            token_indices = router_mask[:, :, idx].bool()
-            next_states[token_indices] = expert(hidden_states[token_indices], layer_output[token_indices])
+
+        next_states = self.experts(layer_output, hidden_states, router_mask)
+        # next_states = hidden_states.clone()
+        # for idx, expert in enumerate(self.experts.values()):
+        #     token_indices = router_mask[:, :, idx].bool()
+        #     next_states[token_indices] = expert(hidden_states[token_indices])
 
         hidden_states = router_probs * next_states
-        torch.cuda.synchronize()
-        end = time.time()
-        self.time.append(end - st)
         return hidden_states
+
+    def fuse_expert(self):
+        wi = torch.stack([self.experts[f"expert_{idx}"].intermediate.dense.weight.data.T for idx in range(self.config.num_experts)], dim=0)
+        wo = torch.stack([self.experts[f"expert_{idx}"].output.dense.weight.data.T for idx in range(self.config.num_experts)], dim=0)
+        device = self.experts[f"expert_0"].intermediate.dense.weight.device
+        del self.experts
+        torch.cuda.empty_cache()
+        self.experts = SwinDenseActDenseSparse(self.config, wi, wo).to(device)
 
 
 class SwinLayer(nn.Module):
